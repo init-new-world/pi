@@ -7,11 +7,14 @@
  * (issues #6259, #6276).
  */
 
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
-import { type SessionEntry, sessionEntryToContextMessages } from "../../src/core/session-manager.ts";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../src/core/session-manager.ts";
 import type { ExtensionFactory } from "../../src/index.ts";
 import { createHarness } from "./harness.ts";
 
@@ -158,5 +161,93 @@ describe("lax message content handling", () => {
 			messageEntry({ role: "user", content: "hello", timestamp: Date.now() }),
 		);
 		expect(message).toMatchObject({ role: "user", content: "hello" });
+	});
+});
+
+/**
+ * A `type:"message"` entry whose `message` field is missing or null violates the
+ * SessionMessageEntry contract. `parseSessionEntries` skips only lines that fail
+ * JSON.parse, so imported or hand-edited files can carry such an entry into every reader.
+ * `_persist` dereferences `e.message.role` on every append, so one such line made
+ * `appendMessage` throw on every turn; the entry had already been pushed into memory and
+ * the leaf advanced, silently diverging the live tree from disk.
+ */
+describe("message entries missing their message field", () => {
+	let dir: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "pi-lax-message-"));
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	function writeSessionFile(entries: unknown[]): string {
+		const file = join(dir, "session.jsonl");
+		const header = { type: "session", version: 3, id: "sess-lax", timestamp: new Date().toISOString(), cwd: dir };
+		writeFileSync(file, `${[header, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		return file;
+	}
+
+	function userEntry(id: string, parentId: string | null, text: string) {
+		return {
+			type: "message",
+			id,
+			parentId,
+			timestamp: new Date().toISOString(),
+			message: { role: "user", content: text, timestamp: Date.now() },
+		};
+	}
+
+	it("loads a session containing an entry without a message field and keeps saving", () => {
+		const file = writeSessionFile([
+			userEntry("m1", null, "hello"),
+			{ type: "message", id: "m2", parentId: "m1", timestamp: new Date().toISOString() },
+		]);
+
+		const sessionManager = SessionManager.open(file, dir);
+
+		// Appending used to throw "Cannot read properties of undefined (reading 'role')"
+		// from _persist() -> appendMessage() on every turn.
+		expect(() =>
+			sessionManager.appendMessage({ role: "user", content: "second", timestamp: Date.now() } as never),
+		).not.toThrow();
+
+		// Building context used to throw from getSessionContextSettings().
+		expect(() => sessionManager.buildSessionProjection()).not.toThrow();
+	});
+
+	it("does not let memory diverge from disk after the malformed entry", () => {
+		const file = writeSessionFile([
+			userEntry("m1", null, "hello"),
+			{ type: "message", id: "m2", parentId: "m1", timestamp: new Date().toISOString() },
+		]);
+
+		const sessionManager = SessionManager.open(file, dir);
+		sessionManager.appendMessage({ role: "user", content: "second", timestamp: Date.now() } as never);
+
+		const inMemoryIds = sessionManager.getEntries().map((entry) => entry.id);
+		const onDiskIds = readFileSync(file, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => (JSON.parse(line) as { id?: string }).id)
+			.filter((id): id is string => id !== undefined);
+
+		// Every appended entry reached the file: no silent, unrecoverable divergence.
+		expect(inMemoryIds.filter((id) => !onDiskIds.includes(id))).toEqual([]);
+	});
+
+	it("treats the missing message as inert rather than as model context", () => {
+		const [message] = sessionEntryToContextMessages({
+			type: "message",
+			id: "m2",
+			parentId: "m1",
+			timestamp: new Date().toISOString(),
+		} as unknown as SessionEntry);
+
+		// Normalized to an empty system message: it must not invent a user or assistant turn
+		// and must not carry any text into the prompt.
+		expect(message).toMatchObject({ role: "system", content: "" });
 	});
 });

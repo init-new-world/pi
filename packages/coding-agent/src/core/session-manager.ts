@@ -351,6 +351,37 @@ export function migrateSessionEntries(entries: FileEntry[]): void {
 	migrateToCurrentVersion(entries);
 }
 
+/**
+ * Normalize message entries whose `message` field is missing or null.
+ *
+ * `parseSessionEntries` only skips lines that fail `JSON.parse`; a line that parses
+ * into a `type:"message"` entry without a `message` field is kept and cast to
+ * `SessionMessageEntry`, whose type requires `message`. Imported or hand-edited files
+ * can therefore violate the contract that every other reader relies on: `_persist`
+ * dereferences `e.message.role` on every append, so one such line makes a session
+ * unwritable for the rest of its life, and the failing append has already advanced the
+ * in-memory leaf, silently diverging memory from disk.
+ *
+ * Substitute an inert empty system message: it keeps the tree intact (entries carry the
+ * parent chain, so they must not be dropped) while contributing no model-visible
+ * content, no model/thinking state, and no effect on the `hasAssistant` flush check.
+ */
+function normalizeMissingMessages(entries: FileEntry[]): void {
+	for (const entry of entries) {
+		if (entry.type !== "message") continue;
+		const messageEntry = entry as SessionMessageEntry;
+		if (messageEntry.message === null || messageEntry.message === undefined) {
+			// Entry timestamps are ISO strings; AgentMessage timestamps are epoch millis.
+			const timestamp = Date.parse(entry.timestamp);
+			messageEntry.message = {
+				role: "system",
+				content: "",
+				timestamp: Number.isNaN(timestamp) ? Date.now() : timestamp,
+			};
+		}
+	}
+}
+
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
 	const entries: FileEntry[] = [];
@@ -424,7 +455,7 @@ function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "
 			thinkingLevel = entry.thinkingLevel;
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
-		} else if (entry.type === "message" && entry.message.role === "assistant") {
+		} else if (entry.type === "message" && entry.message?.role === "assistant") {
 			model = { provider: entry.message.provider, modelId: entry.message.model };
 		}
 	}
@@ -440,7 +471,13 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 	if (entry.type === "message") {
 		const message = entry.message;
 		// Session files are parsed without validation; old versions, forks, or
-		// hand-edited files can contain messages with null/missing content.
+		// hand-edited files can contain messages with null/missing content, and can
+		// even omit the message field itself. `_loadEntries` repairs the latter, but
+		// this is also reached directly with unvalidated entries.
+		if (message == null) {
+			const timestamp = Date.parse(entry.timestamp);
+			return [{ role: "system", content: "", timestamp: Number.isNaN(timestamp) ? Date.now() : timestamp }];
+		}
 		if (message.role === "system" && message.content == null) return [{ ...message, content: "" }];
 		if (
 			(message.role === "user" || message.role === "assistant" || message.role === "toolResult") &&
@@ -503,7 +540,7 @@ export function buildContextEntries(
 		if (entry.id === compaction.firstKeptEntryId) {
 			foundFirstKept = true;
 		}
-		if (foundFirstKept && !(entry.type === "message" && entry.message.role === "system")) {
+		if (foundFirstKept && !(entry.type === "message" && entry.message?.role === "system")) {
 			contextEntries.push(entry);
 		}
 	}
@@ -1085,6 +1122,11 @@ export class SessionManager {
 	private _loadEntries(entries: FileEntry[], options?: NewSessionOptions): void {
 		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 
+		// Repair entries that violate the SessionMessageEntry contract before anything
+		// reads them. Runs before the migration check so a migrated file is rewritten
+		// with the repair already applied.
+		normalizeMissingMessages(entries);
+
 		if (header) {
 			this.fileEntries = entries;
 			this.sessionId = header.id;
@@ -1160,7 +1202,7 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message?.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
 				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
@@ -1712,7 +1754,7 @@ export class SessionManager {
 			// first assistant response, matching the newSession() contract
 			// and avoiding the duplicate-header bug when _persist()'s
 			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message?.role === "assistant");
 			if (hasAssistant) {
 				this._rewriteFile();
 				this.flushed = true;
