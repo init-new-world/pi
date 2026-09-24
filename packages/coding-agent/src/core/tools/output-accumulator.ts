@@ -48,6 +48,8 @@ export class OutputAccumulator {
 	private completedLines = 0;
 	private totalLines = 0;
 	private currentLineBytes = 0;
+	/** Size of the line most recently closed by a newline, including that newline. */
+	private lastCompletedLineBytes = 0;
 	private hasOpenLine = false;
 	private finished = false;
 
@@ -145,6 +147,17 @@ export class OutputAccumulator {
 		return this.currentLineBytes;
 	}
 
+	/**
+	 * Size in bytes of the last line that a newline closed, including the newline.
+	 *
+	 * `getLastLineBytes()` only counts the text after the final newline, so it is 0 once
+	 * output ends with a newline. Callers that describe a *complete* trailing line need the
+	 * size of the line itself, which is what this returns.
+	 */
+	getLastCompletedLineBytes(): number {
+		return this.lastCompletedLineBytes;
+	}
+
 	private appendDecodedText(text: string): void {
 		if (text.length === 0) {
 			return;
@@ -170,6 +183,12 @@ export class OutputAccumulator {
 		} else {
 			this.completedLines += newlines;
 			const tail = text.slice(lastNewline + 1);
+			// The line this chunk's last newline closed spans from the start of the chunk
+			// (which is the start of the line, since any earlier newline completed before it)
+			// up to and including that newline. Its size must include the previously
+			// accumulated bytes of the line it terminated.
+			this.lastCompletedLineBytes =
+				byteLength(text.slice(0, lastNewline + 1)) + (this.hasOpenLine ? this.currentLineBytes : 0);
 			this.currentLineBytes = byteLength(tail);
 			this.hasOpenLine = tail.length > 0;
 		}

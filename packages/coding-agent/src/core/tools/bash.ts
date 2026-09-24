@@ -327,7 +327,12 @@ export function createShellToolDefinition(
 					const startLine = truncation.totalLines - truncation.outputLines + 1;
 					const endLine = truncation.totalLines;
 					if (truncation.lastLinePartial) {
-						const lastLineSize = formatSize(output.getLastLineBytes());
+						// `getLastLineBytes()` counts only the text after the final newline, so it
+						// reports 0 whenever output ends with one. When the newline closed the
+						// line, the size to report is that of the completed line instead.
+						const lastLineSize = formatSize(
+							output.getLastLineBytes() > 0 ? output.getLastLineBytes() : output.getLastCompletedLineBytes(),
+						);
 						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
 					} else if (truncation.truncatedBy === "lines") {
 						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
